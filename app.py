@@ -315,120 +315,150 @@ def pdf_page_to_image(pdf_bytes: bytes, page_num: int = 0, dpi: int = 200) -> "I
 @st.cache_resource(show_spinner=False)
 def load_paddleocr_vl():
     """Load PaddleOCR-VL-1.5 pipeline (cached)."""
+    import os, paddle
+    os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
+    paddle.disable_static()  # Force dynamic mode
+    return PaddleOCRVL()
+
+
+def _create_fresh_pipeline():
+    """Create a new pipeline instance (bypasses cache)."""
+    import os, paddle
+    os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
+    paddle.disable_static()
     return PaddleOCRVL()
 
 
 def run_paddleocr_vl(pipeline, img: "Image.Image"):
     """Run PaddleOCR-VL and normalize results into block dicts."""
-    import tempfile, os, json as _json
+    import tempfile, os, paddle
 
-    # PaddleOCRVL.predict() accepts a file path, so save the image temporarily
+    paddle.disable_static()  # Ensure dynamic mode before every call
+
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         img.save(tmp, format="PNG")
         tmp_path = tmp.name
 
     try:
-        output = pipeline.predict(tmp_path)
+        try:
+            output = list(pipeline.predict(tmp_path))
+        except RuntimeError as e:
+            if "static graph mode" in str(e) or "int(Tensor)" in str(e):
+                # Known PaddlePaddle bug: recreate pipeline and retry
+                st.warning("Reinitializing OCR engine (PaddlePaddle static graph workaround)...")
+                load_paddleocr_vl.clear()  # Clear the cached resource
+                pipeline = _create_fresh_pipeline()
+                # Store the new pipeline so the caller can use it next time
+                st.session_state["_paddle_pipeline"] = pipeline
+                output = list(pipeline.predict(tmp_path))
+            else:
+                raise
     finally:
         os.unlink(tmp_path)
 
+    output_list = output
     blocks = []
     idx = 0
 
-    # Save JSON to a temp dir so we can parse the structured output
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for res in output:
-            # Try to save and re-read the JSON for structured parsing
-            try:
-                res.save_to_json(save_path=tmpdir)
-            except Exception:
-                pass
+    # ---- Label mapping: PaddleOCR layout labels → our UI type names ----
+    LABEL_MAP = {
+        "doc_title": "title",
+        "title": "title",
+        "text": "text",
+        "paragraph": "text",
+        "image": "figure",
+        "figure": "figure",
+        "figure_caption": "text",
+        "table": "table",
+        "table_caption": "text",
+        "header": "pageheader",
+        "page_header": "pageheader",
+        "page-header": "pageheader",
+        "footer": "pagefooter",
+        "page_footer": "pagefooter",
+        "page-footer": "pagefooter",
+        "reference": "reference",
+        "equation": "equation",
+        "formula": "equation",
+        "list": "list",
+        "section_header": "sectionheader",
+        "section-header": "sectionheader",
+        "abstract": "text",
+        "seal": "figure",
+    }
 
-        # Look for any generated JSON files
-        json_files = [f for f in os.listdir(tmpdir) if f.endswith(".json")]
-        for jf in json_files:
-            with open(os.path.join(tmpdir, jf), "r", encoding="utf-8") as fh:
-                data = _json.load(fh)
+    def _normalize_label(raw_label: str) -> str:
+        key = raw_label.lower().strip().replace(" ", "_")
+        return LABEL_MAP.get(key, "text")
 
-            # PaddleOCRVL JSON output can vary; handle common structures
-            items = data if isinstance(data, list) else data.get("result", data.get("blocks", [data]))
-            if isinstance(items, dict):
-                items = [items]
+    for res in output_list:
+        # ------------------------------------------------------------------
+        # Build a score lookup from layout_det_res.boxes (coordinate → score)
+        # ------------------------------------------------------------------
+        score_lookup = {}  # (x0, y0, x1, y1) → score
+        layout_det = res.get("layout_det_res")
+        if isinstance(layout_det, dict):
+            for box_info in (layout_det.get("boxes") or []):
+                if isinstance(box_info, dict):
+                    coord = box_info.get("coordinate")
+                    score = box_info.get("score", 0.0)
+                    if coord and len(coord) == 4:
+                        score_lookup[tuple(int(c) for c in coord)] = float(score)
 
-            for item in items:
-                block_type = item.get("type", item.get("label", "text")).lower()
-                # Normalize common type names
-                type_map = {
-                    "paragraph": "text",
-                    "page_header": "pageheader",
-                    "page_footer": "pagefooter",
-                    "section_header": "sectionheader",
-                    "image": "figure",
-                    "caption": "text",
-                }
-                block_type = type_map.get(block_type, block_type)
+        # ------------------------------------------------------------------
+        # Primary: iterate parsing_res_list (PaddleOCRVLBlock objects)
+        # Each has: .bbox, .content, .label, .image, .polygon_points
+        # ------------------------------------------------------------------
+        parsing_list = res.get("parsing_res_list") or []
 
-                bbox = item.get("bbox", item.get("box", [0, 0, 50, 50]))
-                # Some formats use [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] polygons
-                if bbox and isinstance(bbox[0], (list, tuple)):
-                    xs = [p[0] for p in bbox]
-                    ys = [p[1] for p in bbox]
-                    bbox = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
-                else:
-                    bbox = [int(b) for b in bbox[:4]]
+        for pr in parsing_list:
+            # --- bbox ---
+            bbox_raw = getattr(pr, "bbox", None) or [0, 0, img.width, img.height]
+            bbox = [int(v) for v in bbox_raw]
 
-                text_content = item.get("text", item.get("content", item.get("html", "")))
-                if isinstance(text_content, list):
-                    text_content = "\n".join(str(t) for t in text_content)
+            # --- label ---
+            raw_label = getattr(pr, "label", "text") or "text"
+            block_type = _normalize_label(raw_label)
 
-                confidence = item.get("confidence", item.get("score", round(random.uniform(0.88, 0.99), 2)))
-                if isinstance(confidence, (list, tuple)):
-                    confidence = sum(confidence) / len(confidence) if confidence else 0.9
+            # --- text content ---
+            text = getattr(pr, "content", "") or ""
+
+            # --- confidence: match against layout_det score_lookup ---
+            conf = score_lookup.get(tuple(bbox), 0.90)
+
+            blocks.append({
+                "id": idx,
+                "type": block_type,
+                "bbox": bbox,
+                "text": str(text).strip(),
+                "confidence": conf,
+            })
+            idx += 1
+
+        # ------------------------------------------------------------------
+        # Fallback: if parsing_res_list was empty, try layout_det_res.boxes
+        # ------------------------------------------------------------------
+        if not blocks and layout_det and isinstance(layout_det, dict):
+            for box_info in (layout_det.get("boxes") or []):
+                if not isinstance(box_info, dict):
+                    continue
+                coord = box_info.get("coordinate", [0, 0, img.width, img.height])
+                bbox = [int(c) for c in coord] if len(coord) == 4 else [0, 0, img.width, img.height]
+                raw_label = box_info.get("label", "text") or "text"
+                block_type = _normalize_label(raw_label)
+                conf = float(box_info.get("score", 0.0))
 
                 blocks.append({
                     "id": idx,
                     "type": block_type,
                     "bbox": bbox,
-                    "text": str(text_content),
-                    "confidence": round(float(confidence), 2),
+                    "text": "",
+                    "confidence": conf,
                 })
                 idx += 1
 
-    # Fallback: if JSON parsing yielded nothing, try to extract from result objects directly
     if not blocks:
-        for res in output:
-            # Try common attribute patterns on the result object
-            for attr in ("blocks", "results", "regions", "items"):
-                raw_items = getattr(res, attr, None)
-                if raw_items and isinstance(raw_items, (list, tuple)):
-                    for item in raw_items:
-                        if isinstance(item, dict):
-                            btype = item.get("type", item.get("label", "text")).lower()
-                            bbox = item.get("bbox", item.get("box", [0, 0, 50, 50]))
-                            if bbox and isinstance(bbox[0], (list, tuple)):
-                                xs = [p[0] for p in bbox]
-                                ys = [p[1] for p in bbox]
-                                bbox = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
-                            text_content = item.get("text", item.get("content", ""))
-                            blocks.append({
-                                "id": idx, "type": btype,
-                                "bbox": [int(b) for b in bbox[:4]],
-                                "text": str(text_content),
-                                "confidence": round(float(item.get("confidence", 0.93)), 2),
-                            })
-                            idx += 1
-                    break
-
-            # Also try getting markdown as a text fallback
-            if not blocks:
-                md = getattr(res, "markdown", None)
-                if md:
-                    blocks.append({
-                        "id": 0, "type": "text",
-                        "bbox": [0, 0, img.width, img.height],
-                        "text": str(md),
-                        "confidence": 0.95,
-                    })
+        print("WARNING: No blocks extracted from document! Check pipeline output.")
 
     return blocks
 
@@ -729,7 +759,7 @@ cache_key = hashlib.md5(pdf_bytes).hexdigest() + f"_p{page_num}_d{dpi}_l{lang}"
 if cache_key not in st.session_state:
     if HAS_PADDLE:
         with st.spinner("Running PaddleOCR-VL-1.5..."):
-            pipeline = load_paddleocr_vl()
+            pipeline = st.session_state.get("_paddle_pipeline") or load_paddleocr_vl()
             blocks = run_paddleocr_vl(pipeline, page_img)
     else:
         blocks = generate_mock_blocks(page_img.width, page_img.height)
